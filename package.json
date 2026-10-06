@@ -1,0 +1,135 @@
+{
+	"name": "@mhbdev/redis",
+	"version": "0.2.0",
+	"description": "Typed, production-ready Redis infrastructure for Node.js and Bun.",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"sideEffects": false,
+	"engines": {
+		"node": ">=20"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/mhbdev/redis.git"
+	},
+	"bugs": {
+		"url": "https://github.com/mhbdev/redis/issues"
+	},
+	"homepage": "https://github.com/mhbdev/redis#readme",
+	"keywords": [
+		"redis",
+		"rate-limit",
+		"cache",
+		"lock",
+		"queue",
+		"pubsub",
+		"typescript"
+	],
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE",
+		"CHANGELOG.md",
+		"docs"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./node": {
+			"types": "./dist/node/index.d.ts",
+			"import": "./dist/node/index.js",
+			"default": "./dist/node/index.js"
+		},
+		"./ioredis": {
+			"types": "./dist/ioredis/index.d.ts",
+			"import": "./dist/ioredis/index.js",
+			"default": "./dist/ioredis/index.js"
+		},
+		"./bullmq": {
+			"types": "./dist/bullmq/index.d.ts",
+			"import": "./dist/bullmq/index.js",
+			"default": "./dist/bullmq/index.js"
+		},
+		"./rate-limit": {
+			"types": "./dist/rate-limit/index.d.ts",
+			"import": "./dist/rate-limit/index.js",
+			"default": "./dist/rate-limit/index.js"
+		},
+		"./cache": {
+			"types": "./dist/cache/index.d.ts",
+			"import": "./dist/cache/index.js",
+			"default": "./dist/cache/index.js"
+		},
+		"./locks": {
+			"types": "./dist/locks/index.d.ts",
+			"import": "./dist/locks/index.js",
+			"default": "./dist/locks/index.js"
+		},
+		"./pubsub": {
+			"types": "./dist/pubsub/index.d.ts",
+			"import": "./dist/pubsub/index.js",
+			"default": "./dist/pubsub/index.js"
+		},
+		"./queue": {
+			"types": "./dist/queue/index.d.ts",
+			"import": "./dist/queue/index.js",
+			"default": "./dist/queue/index.js"
+		},
+		"./testing": {
+			"types": "./dist/testing/index.d.ts",
+			"import": "./dist/testing/index.js",
+			"default": "./dist/testing/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"clean": "node -e \"import('node:fs/promises').then(({rm}) => rm('dist', {recursive:true, force:true}))\"",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:integration": "vitest run test/integration --passWithNoTests",
+		"test:watch": "vitest",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"audit": "npm audit --audit-level=high && npm audit --omit=dev --audit-level=high && npm audit signatures",
+		"pack:check": "npm run build && publint && attw --pack --profile esm-only --quiet && npm pack --dry-run && npm run pack:smoke",
+		"pack:smoke": "node scripts/pack-smoke.mjs",
+		"version": "changeset version",
+		"release": "changeset publish"
+	},
+	"dependencies": {
+		"redis": "^6.3.0"
+	},
+	"peerDependencies": {
+		"bullmq": ">=5",
+		"ioredis": ">=5"
+	},
+	"peerDependenciesMeta": {
+		"bullmq": {
+			"optional": true
+		},
+		"ioredis": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.2",
+		"@biomejs/biome": "^2.5.15",
+		"@changesets/changelog-github": "^1.0.1",
+		"@changesets/cli": "^3.0.3",
+		"@types/node": "^25.0.0",
+		"publint": "^0.3.25",
+		"typescript": "7.0.2",
+		"vitest": "^5.0.3"
+	}
+}

@@ -1,0 +1,17 @@
+{
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"formatter": { "enabled": true, "indentStyle": "tab", "lineWidth": 90 },
+	"files": {
+		"ignoreUnknown": false,
+		"includes": ["**", "!dist", "!coverage", "!node_modules"]
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"preset": "recommended",
+			"correctness": { "noUnusedImports": "error", "noUnusedVariables": "error" },
+			"style": { "useConst": "error", "useImportType": "error" }
+		}
+	},
+	"assist": { "actions": { "source": { "organizeImports": "on" } } }
+}
