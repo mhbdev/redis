@@ -38,7 +38,7 @@ jobs:
       - run: npm run pack:check
       - run: npm run audit
       - name: Create release PR or publish
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
           version-script: npm run version
           publish-script: npm run release
