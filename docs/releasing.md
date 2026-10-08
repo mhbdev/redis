@@ -9,11 +9,13 @@ dry-run output:
 ```sh
 npm whoami
 npm run pack:check
-npm publish --access public
+npm publish --access public --provenance=false
 ```
 
-The package currently uses public access and provenance. Do not add an npm token to the
-repository or GitHub secrets for this workflow.
+The one-time local publication explicitly disables provenance because a local shell has
+no OIDC provider. The package still declares provenance by default, and the GitHub
+workflow will generate provenance through npm trusted publishing. Do not add an npm
+token to the repository or GitHub secrets for that workflow.
 
 ## Configure npm trusted publishing
 
