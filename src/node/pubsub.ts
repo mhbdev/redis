@@ -1,10 +1,7 @@
 import { createClient, type RedisClientType } from "redis";
 import type { RedisCodec } from "../core/codec.js";
-import {
-	asError,
-	RedisClientStateError,
-	RedisConfigurationError,
-} from "../core/errors.js";
+import { RedisClientStateError, RedisConfigurationError } from "../core/errors.js";
+import { notifyError } from "../core/hooks.js";
 import type { RedisSubscriptionTransport } from "../pubsub/contracts.js";
 
 type EmptyModule = Record<never, never>;
@@ -16,7 +13,7 @@ export function createNodePubSubTransport(
 	let publisher: Client | null = null;
 	let subscriber: Client | null = null;
 	let closed = false;
-	const report = (error: unknown) => options.onError?.(asError(error));
+	const report = (error: unknown) => notifyError(options.onError, error);
 	return {
 		async publish(channel, message) {
 			if (closed)

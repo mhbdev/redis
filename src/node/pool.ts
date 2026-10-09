@@ -14,6 +14,7 @@ import {
 	type RedisScriptOptions,
 	withTimeout,
 } from "../core/executor.js";
+import { notifyError, notifyHook } from "../core/hooks.js";
 import type { RedisClientOptions } from "./client.js";
 import { normalizeNodeRedisError } from "./errors.js";
 
@@ -93,7 +94,11 @@ export class RedisPool implements RedisExecutor {
 		if (this.connected) return;
 		this.connecting ??= withTimeout(
 			async () => {
-				this.options.hooks?.onStateChange?.("connecting");
+				notifyHook(
+					this.options.hooks?.onStateChange,
+					this.options.hooks?.onError,
+					"connecting",
+				);
 				await this.pool.connect();
 			},
 			this.connectTimeoutMs,
@@ -101,7 +106,11 @@ export class RedisPool implements RedisExecutor {
 		)
 			.then(() => {
 				this.connected = true;
-				this.options.hooks?.onStateChange?.("ready");
+				notifyHook(
+					this.options.hooks?.onStateChange,
+					this.options.hooks?.onError,
+					"ready",
+				);
 			})
 			.catch((error: unknown) => {
 				const normalized = normalizeNodeRedisError(error);
@@ -129,7 +138,7 @@ export class RedisPool implements RedisExecutor {
 			throw new RedisRequestAbortedError(request.signal.reason);
 		await this.connect();
 		const started = Date.now();
-		this.options.hooks?.onCommandStart?.(command);
+		notifyHook(this.options.hooks?.onCommandStart, this.options.hooks?.onError, command);
 		try {
 			return await withTimeout(
 				(signal) =>
@@ -143,7 +152,12 @@ export class RedisPool implements RedisExecutor {
 			this.reportError(normalized);
 			throw normalized;
 		} finally {
-			this.options.hooks?.onCommandEnd?.(command, Date.now() - started);
+			notifyHook(
+				this.options.hooks?.onCommandEnd,
+				this.options.hooks?.onError,
+				command,
+				Date.now() - started,
+			);
 		}
 	}
 
@@ -179,13 +193,13 @@ export class RedisPool implements RedisExecutor {
 		this.closed = true;
 		await this.connecting?.catch(() => undefined);
 		await this.pool.close();
-		this.options.hooks?.onStateChange?.("closed");
+		notifyHook(this.options.hooks?.onStateChange, this.options.hooks?.onError, "closed");
 	}
 
 	private reportError(error: Error): void {
-		this.options.onError?.(error);
-		this.options.hooks?.onError?.(error);
-		this.options.hooks?.onStateChange?.("error");
+		notifyError(this.options.onError, error);
+		notifyError(this.options.hooks?.onError, error);
+		notifyHook(this.options.hooks?.onStateChange, this.options.hooks?.onError, "error");
 	}
 }
 

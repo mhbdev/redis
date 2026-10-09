@@ -20,6 +20,7 @@ import {
 	type RedisScriptOptions,
 	withTimeout,
 } from "../core/executor.js";
+import { notifyError, notifyHook } from "../core/hooks.js";
 import { normalizeNodeRedisError } from "./errors.js";
 
 type EmptyModule = Record<never, never>;
@@ -123,12 +124,20 @@ export class RedisClient implements RedisConnection {
 		});
 		client.on("error", (error) => {
 			const normalized = asError(error);
-			this.options.onError?.(normalized);
-			this.options.hooks?.onError?.(normalized);
-			this.options.hooks?.onStateChange?.("error");
+			notifyError(this.options.onError, normalized);
+			notifyError(this.options.hooks?.onError, normalized);
+			notifyHook(this.options.hooks?.onStateChange, this.options.hooks?.onError, "error");
 		});
-		client.on("ready", () => this.options.hooks?.onStateChange?.("ready"));
-		client.on("reconnecting", () => this.options.hooks?.onStateChange?.("connecting"));
+		client.on("ready", () =>
+			notifyHook(this.options.hooks?.onStateChange, this.options.hooks?.onError, "ready"),
+		);
+		client.on("reconnecting", () =>
+			notifyHook(
+				this.options.hooks?.onStateChange,
+				this.options.hooks?.onError,
+				"connecting",
+			),
+		);
 		return client;
 	}
 
@@ -144,7 +153,11 @@ export class RedisClient implements RedisConnection {
 		const client = this.client;
 		this.connecting ??= withTimeout(
 			async () => {
-				this.options.hooks?.onStateChange?.("connecting");
+				notifyHook(
+					this.options.hooks?.onStateChange,
+					this.options.hooks?.onError,
+					"connecting",
+				);
 				await client.connect();
 			},
 			this.options.connectTimeoutMs,
@@ -176,7 +189,7 @@ export class RedisClient implements RedisConnection {
 			throw new RedisRequestAbortedError(options.signal.reason);
 		await this.connect();
 		const started = Date.now();
-		this.options.hooks?.onCommandStart?.(command);
+		notifyHook(this.options.hooks?.onCommandStart, this.options.hooks?.onError, command);
 		try {
 			return await withTimeout(
 				(signal) => this.sendCommand<T>(command, signal),
@@ -185,7 +198,12 @@ export class RedisClient implements RedisConnection {
 				options.signal,
 			);
 		} finally {
-			this.options.hooks?.onCommandEnd?.(command, Date.now() - started);
+			notifyHook(
+				this.options.hooks?.onCommandEnd,
+				this.options.hooks?.onError,
+				command,
+				Date.now() - started,
+			);
 		}
 	}
 
@@ -230,7 +248,11 @@ export class RedisClient implements RedisConnection {
 			this.closed = true;
 			await this.connecting?.catch(() => undefined);
 			if (this.client.isOpen) await this.client.close();
-			this.options.hooks?.onStateChange?.("closed");
+			notifyHook(
+				this.options.hooks?.onStateChange,
+				this.options.hooks?.onError,
+				"closed",
+			);
 		})();
 		await this.closing;
 	}

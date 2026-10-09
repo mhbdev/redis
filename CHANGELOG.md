@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+### Patch Changes
+
+- Correct delayed stream reply parsing and add safe metadata-only queue lifecycle hooks.
+
 ## 0.2.2
 
 ### Patch Changes

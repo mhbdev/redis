@@ -11,3 +11,19 @@ side effects.
 
 Use a pool when workers need blocking reads or concurrent command execution. Keep queue
 names and prefixes stable during rolling deployments.
+
+Workers accept metadata-only lifecycle hooks through `QueueWorkerOptions.hooks`:
+
+```ts
+queue.worker(handleJob, {
+  hooks: {
+    onJobStart: ({ id, attempts }) => metrics.increment("queue.started", { id, attempts }),
+    onJobFailure: ({ id }, error) => reportJobFailure(id, error),
+    onDeadLetter: ({ id }) => metrics.increment("queue.dead_letter", { id }),
+    onError: (error) => reportInfrastructureError(error),
+  },
+});
+```
+
+Hooks receive job identifiers and counters, never the job payload. Observer exceptions
+are isolated from queue processing, and the package does not write to the console.

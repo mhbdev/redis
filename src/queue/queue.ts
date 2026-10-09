@@ -1,6 +1,7 @@
 import { jsonCodec, type RedisCodec } from "../core/codec.js";
-import { RedisQueueError } from "../core/errors.js";
+import { asError, RedisQueueError } from "../core/errors.js";
 import type { RedisExecutor } from "../core/executor.js";
+import { notifyError } from "../core/hooks.js";
 
 export type QueueJob<T> = Readonly<{
 	id: string;
@@ -25,6 +26,22 @@ export type QueueWorkerOptions = Readonly<{
 	consumer?: string;
 	blockMs?: number;
 	concurrency?: number;
+	hooks?: QueueWorkerHooks;
+}>;
+
+export type QueueJobContext = Readonly<{
+	id: string;
+	attempts: number;
+	enqueuedAt: number;
+}>;
+
+/** Lifecycle hooks receive job metadata without the potentially sensitive payload. */
+export type QueueWorkerHooks = Readonly<{
+	onJobStart?: (job: QueueJobContext) => void;
+	onJobComplete?: (job: QueueJobContext) => void;
+	onJobFailure?: (job: QueueJobContext, error: Error) => void;
+	onDeadLetter?: (job: QueueJobContext, error?: Error) => void;
+	onError?: (error: Error) => void;
 }>;
 
 export interface JobQueue<T> {
@@ -165,6 +182,7 @@ export class RedisQueueWorker<T> implements QueueWorker {
 	private readonly consumer: string;
 	private readonly blockMs: number;
 	private readonly concurrency: number;
+	private readonly hooks?: QueueWorkerHooks;
 	private stopping = false;
 	private running: Promise<void> | null = null;
 
@@ -177,6 +195,7 @@ export class RedisQueueWorker<T> implements QueueWorker {
 		this.consumer = options.consumer ?? crypto.randomUUID();
 		this.blockMs = options.blockMs ?? 1_000;
 		this.concurrency = options.concurrency ?? 1;
+		this.hooks = options.hooks;
 		if (!this.group.trim() || !this.consumer.trim())
 			throw new RedisQueueError("Queue consumer group and consumer are required");
 		if (!Number.isSafeInteger(this.blockMs) || this.blockMs <= 0)
@@ -188,9 +207,14 @@ export class RedisQueueWorker<T> implements QueueWorker {
 	async start(): Promise<void> {
 		if (this.running) return this.running;
 		this.stopping = false;
-		this.running = this.run().finally(() => {
-			this.running = null;
-		});
+		this.running = this.run()
+			.catch((error: unknown) => {
+				this.reportError(error);
+				throw error;
+			})
+			.finally(() => {
+				this.running = null;
+			});
 		return this.running;
 	}
 
@@ -258,16 +282,20 @@ export class RedisQueueWorker<T> implements QueueWorker {
 		let job: QueueJob<T>;
 		try {
 			job = this.queue.decode(entry.payload);
-		} catch {
+		} catch (error) {
+			this.reportError(error);
 			await this.queue.redis.eval(REQUEUE_FAILED_SCRIPT, {
 				keys: [this.queue.streamKey, this.queue.deadLetterKey],
 				arguments: [this.group, entry.id, entry.payload],
 			});
 			return;
 		}
+		const context = toJobContext(job);
+		this.notifyJobStart(context);
 		try {
 			await this.handler(job);
-		} catch (_error) {
+		} catch (error) {
+			this.notifyJobFailure(context, error);
 			const retry = { ...job, attempts: job.attempts + 1 };
 			const target =
 				retry.attempts >= this.queue.attempts
@@ -277,9 +305,49 @@ export class RedisQueueWorker<T> implements QueueWorker {
 				keys: [this.queue.streamKey, target],
 				arguments: [this.group, entry.id, this.encodeRetry(retry)],
 			});
+			if (target === this.queue.deadLetterKey)
+				this.notifyDeadLetter(toJobContext(retry), error);
 			return;
 		}
 		await this.queue.redis.execute(["XACK", this.queue.streamKey, this.group, entry.id]);
+		this.notifyJobComplete(context);
+	}
+
+	private notifyJobStart(job: QueueJobContext): void {
+		try {
+			this.hooks?.onJobStart?.(job);
+		} catch (error) {
+			this.reportError(error);
+		}
+	}
+
+	private notifyJobComplete(job: QueueJobContext): void {
+		try {
+			this.hooks?.onJobComplete?.(job);
+		} catch (error) {
+			this.reportError(error);
+		}
+	}
+
+	private notifyJobFailure(job: QueueJobContext, error: unknown): void {
+		const failure = asError(error);
+		try {
+			this.hooks?.onJobFailure?.(job, failure);
+		} catch (hookError) {
+			this.reportError(hookError);
+		}
+	}
+
+	private notifyDeadLetter(job: QueueJobContext, error?: unknown): void {
+		try {
+			this.hooks?.onDeadLetter?.(job, error === undefined ? undefined : asError(error));
+		} catch (hookError) {
+			this.reportError(hookError);
+		}
+	}
+
+	private reportError(error: unknown): void {
+		notifyError(this.hooks?.onError, error);
 	}
 
 	private encodeRetry(job: QueueJob<T>): string {
@@ -299,28 +367,118 @@ const PROMOTE_DUE_SCRIPT = `local due = redis.call("ZRANGEBYSCORE", KEYS[1], "-i
 const REQUEUE_FAILED_SCRIPT = `redis.call("XADD", KEYS[2], "*", "payload", ARGV[3]) redis.call("XACK", KEYS[1], ARGV[1], ARGV[2]) return 1`;
 
 function parseStreamResponse(value: unknown): ParsedEntry[] {
-	if (!Array.isArray(value) || value.length === 0) return [];
-	const streams = value[0];
-	if (!Array.isArray(streams) || !Array.isArray(streams[1])) return [];
 	const result: ParsedEntry[] = [];
-	for (const rawEntry of streams[1]) {
-		if (
-			!Array.isArray(rawEntry) ||
-			typeof rawEntry[0] !== "string" ||
-			!Array.isArray(rawEntry[1])
-		)
-			continue;
-		const fields = rawEntry[1] as unknown[];
-		const payloadIndex = fields.indexOf("payload");
-		const payload = payloadIndex >= 0 ? fields[payloadIndex + 1] : undefined;
-		if (typeof payload === "string") result.push({ id: rawEntry[0], payload });
+	const streams = toPairs(value);
+	for (const [streamName, rawEntries] of streams) {
+		if (keyString(streamName) === undefined) continue;
+		for (const rawEntry of toEntries(rawEntries)) {
+			const [id, rawFields] = toEntry(rawEntry);
+			if (!id) continue;
+			const payload = getField(rawFields, "payload");
+			if (typeof payload === "string") result.push({ id, payload });
+		}
 	}
 	return result;
 }
 
 function parseAutoClaimResponse(value: unknown): ParsedEntry[] {
-	if (!Array.isArray(value) || !Array.isArray(value[1])) return [];
-	return parseStreamResponse([["recovered", value[1]]]);
+	if (Array.isArray(value) && Array.isArray(value[1]))
+		return parseStreamResponse([["recovered", value[1]]]);
+	if (isRecord(value) && Array.isArray(value.messages))
+		return parseStreamResponse([["recovered", value.messages]]);
+	return [];
+}
+
+function toPairs(value: unknown): Array<[unknown, unknown]> {
+	if (value instanceof Map) return [...value.entries()];
+	if (Array.isArray(value)) {
+		if (value.length >= 2 && keyString(value[0]) !== undefined) {
+			const pairs: Array<[unknown, unknown]> = [];
+			for (let index = 0; index + 1 < value.length; index += 2)
+				pairs.push([value[index], value[index + 1]]);
+			return pairs;
+		}
+		return value.flatMap((entry) => {
+			if (Array.isArray(entry) && entry.length >= 2) return [[entry[0], entry[1]]];
+			if (isRecord(entry)) {
+				const streamName = entry.name ?? entry.stream;
+				const entries = entry.messages ?? entry.entries;
+				if (streamName !== undefined && entries !== undefined)
+					return [[streamName, entries]];
+			}
+			return [];
+		});
+	}
+	if (isRecord(value)) {
+		if (Array.isArray(value.streams)) return toPairs(value.streams);
+		if (Array.isArray(value.messages))
+			return [[value.stream ?? "stream", value.messages]];
+		return Object.entries(value);
+	}
+	return [];
+}
+
+function toEntries(value: unknown): unknown[] {
+	if (Array.isArray(value)) {
+		if (
+			value.length >= 2 &&
+			keyString(value[0]) !== undefined &&
+			!Array.isArray(value[0])
+		) {
+			const entries: unknown[] = [];
+			for (let index = 0; index + 1 < value.length; index += 2)
+				entries.push([value[index], value[index + 1]]);
+			return entries;
+		}
+		return value;
+	}
+	if (value instanceof Map) return [...value.entries()];
+	if (isRecord(value)) {
+		if (Array.isArray(value.messages)) return value.messages;
+		if (Array.isArray(value.entries)) return value.entries;
+	}
+	return [];
+}
+
+function toEntry(value: unknown): [string | undefined, unknown] {
+	if (Array.isArray(value)) return [keyString(value[0]), value[1]];
+	if (value instanceof Map) {
+		const [id, fields] = value.entries().next().value ?? [];
+		return [keyString(id), fields];
+	}
+	if (isRecord(value)) {
+		const id = value.id;
+		return [keyString(id), value.message ?? value.fields];
+	}
+	return [undefined, undefined];
+}
+
+function getField(fields: unknown, name: string): unknown {
+	if (fields instanceof Map) {
+		for (const [key, value] of fields) {
+			if (keyString(key) === name) return value;
+		}
+		return undefined;
+	}
+	if (Array.isArray(fields)) {
+		const index = fields.findIndex((key) => keyString(key) === name);
+		return index < 0 ? undefined : fields[index + 1];
+	}
+	return isRecord(fields) ? fields[name] : undefined;
+}
+
+function keyString(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+	return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toJobContext<T>(job: QueueJob<T>): QueueJobContext {
+	return { id: job.id, attempts: job.attempts, enqueuedAt: job.enqueuedAt };
 }
 
 export function createQueue<T>(options: QueueOptions<T>): RedisQueue<T> {

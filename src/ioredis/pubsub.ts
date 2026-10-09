@@ -1,8 +1,5 @@
-import {
-	asError,
-	RedisClientStateError,
-	RedisConfigurationError,
-} from "../core/errors.js";
+import { RedisClientStateError, RedisConfigurationError } from "../core/errors.js";
+import { notifyError } from "../core/hooks.js";
 import type { RedisSubscriptionTransport } from "../pubsub/contracts.js";
 
 export interface IoredisPubSubClientLike {
@@ -35,10 +32,10 @@ export function createIoredisPubSubTransport(
 		for (const listener of listeners.get(channel) ?? []) {
 			try {
 				void Promise.resolve(listener(message)).catch((error: unknown) =>
-					options.onError?.(asError(error)),
+					notifyError(options.onError, error),
 				);
 			} catch (error) {
-				options.onError?.(asError(error));
+				notifyError(options.onError, error);
 			}
 		}
 	};

@@ -12,31 +12,27 @@ class WorkerExecutor implements RedisExecutor {
 	readonly scripts: string[] = [];
 	private readCount = 0;
 
+	constructor(private readonly useMapResponse = false) {}
+
 	async execute<T = unknown>(command: RedisCommand): Promise<T> {
 		this.commands.push(command);
 		if (command[0] === "XAUTOCLAIM") return ["0-0", []] as T;
 		if (command[0] === "XREADGROUP") {
 			this.readCount += 1;
 			if (this.readCount === 1) {
-				return [
-					[
-						"queue:jobs:stream",
-						[
-							[
-								"1-0",
-								[
-									"payload",
-									JSON.stringify({
-										id: "job-1",
-										data: JSON.stringify({ value: "retry" }),
-										attempts: 0,
-										enqueuedAt: 1,
-									}),
-								],
-							],
-						],
-					],
-				] as T;
+				const encoded = JSON.stringify({
+					id: "job-1",
+					data: JSON.stringify({ value: "retry" }),
+					attempts: 0,
+					enqueuedAt: 1,
+				});
+				if (this.useMapResponse) {
+					return [
+						Buffer.from("queue:jobs:stream"),
+						[[Buffer.from("1-0"), new Map([[Buffer.from("payload"), encoded]])]],
+					] as T;
+				}
+				return [["queue:jobs:stream", [["1-0", ["payload", encoded]]]]] as T;
 			}
 			return [] as T;
 		}
@@ -86,5 +82,31 @@ describe("RedisQueue", () => {
 		expect(promotion.indexOf("XADD")).toBeLessThan(promotion.indexOf("ZREM"));
 		expect(retry.indexOf("XADD")).toBeLessThan(retry.indexOf("XACK"));
 		expect(redis.commands.some((command) => command[0] === "XACK")).toBe(false);
+	});
+
+	it("parses RESP3 map stream replies and emits metadata-only job hooks", async () => {
+		const redis = new WorkerExecutor(true);
+		const queue = createQueue({ redis, name: "jobs" });
+		const started: string[] = [];
+		const completed: string[] = [];
+		const observerErrors: string[] = [];
+		let worker!: ReturnType<typeof queue.worker>;
+		worker = queue.worker(async () => undefined, {
+			hooks: {
+				onJobStart: ({ id }) => {
+					started.push(id);
+					throw new Error("observer failure");
+				},
+				onJobComplete: ({ id }) => completed.push(id),
+				onError: (error) => observerErrors.push(error.message),
+			},
+		});
+		redis.stopAfterNextRead(() => void worker.close());
+
+		await worker.start();
+
+		expect(started).toEqual(["job-1"]);
+		expect(completed).toEqual(["job-1"]);
+		expect(observerErrors).toEqual(["observer failure"]);
 	});
 });
