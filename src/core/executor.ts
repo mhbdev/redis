@@ -1,4 +1,8 @@
-import { RedisConfigurationError, RedisTimeoutError } from "./errors.js";
+import {
+	RedisConfigurationError,
+	RedisRequestAbortedError,
+	RedisTimeoutError,
+} from "./errors.js";
 
 export type RedisCommand = readonly string[];
 export type RedisCommandOptions = Readonly<{ signal?: AbortSignal }>;
@@ -42,13 +46,30 @@ export async function withTimeout<T>(
 	operation: (signal: AbortSignal) => Promise<T>,
 	timeoutMs: number,
 	message = "Redis operation timed out",
+	externalSignal?: AbortSignal,
 ): Promise<T> {
 	assertPositiveInteger(timeoutMs, "Redis timeout");
+	if (externalSignal?.aborted) throw new RedisRequestAbortedError(externalSignal.reason);
 	const controller = new AbortController();
+	const signal = externalSignal
+		? AbortSignal.any([controller.signal, externalSignal])
+		: controller.signal;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let abortHandler: (() => void) | undefined;
 	try {
 		return await Promise.race([
-			operation(controller.signal),
+			operation(signal),
+			...(externalSignal
+				? [
+						new Promise<T>((_, reject) => {
+							abortHandler = () => {
+								controller.abort(externalSignal.reason);
+								reject(new RedisRequestAbortedError(externalSignal.reason));
+							};
+							externalSignal.addEventListener("abort", abortHandler, { once: true });
+						}),
+					]
+				: []),
 			new Promise<T>((_, reject) => {
 				timer = setTimeout(() => {
 					controller.abort();
@@ -58,5 +79,7 @@ export async function withTimeout<T>(
 		]);
 	} finally {
 		if (timer) clearTimeout(timer);
+		if (externalSignal && abortHandler)
+			externalSignal.removeEventListener("abort", abortHandler);
 	}
 }

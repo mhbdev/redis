@@ -4,6 +4,7 @@ import {
 	RedisClientStateError,
 	RedisConfigurationError,
 	RedisConnectionError,
+	RedisRequestAbortedError,
 	RedisTimeoutError,
 } from "../core/errors.js";
 import {
@@ -31,18 +32,32 @@ export class RedisPool implements RedisExecutor {
 	private readonly pool: PoolClient;
 	private readonly commandTimeoutMs: number;
 	private readonly acquireTimeoutMs: number;
+	private readonly connectTimeoutMs: number;
 	private closed = false;
 	private connected = false;
+	private connecting: Promise<void> | null = null;
 
 	constructor(private readonly options: RedisPoolOptions) {
 		const minimum = options.minimum ?? 1;
 		const maximum = options.maximum ?? 10;
 		this.commandTimeoutMs = options.commandTimeoutMs ?? 3_000;
 		this.acquireTimeoutMs = options.acquireTimeoutMs ?? 3_000;
+		this.connectTimeoutMs = options.connectTimeoutMs ?? 3_000;
+		const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 100;
+		const reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 1_000;
+		const maxReconnectAttempts = options.maxReconnectAttempts ?? 3;
+		const cleanupDelayMs = options.cleanupDelayMs ?? 3_000;
 		assertPositiveInteger(minimum, "Redis pool minimum");
 		assertPositiveInteger(maximum, "Redis pool maximum");
 		assertPositiveInteger(this.commandTimeoutMs, "Redis command timeout");
 		assertPositiveInteger(this.acquireTimeoutMs, "Redis acquire timeout");
+		assertPositiveInteger(this.connectTimeoutMs, "Redis connect timeout");
+		assertPositiveInteger(reconnectBaseDelayMs, "Redis reconnect base delay");
+		assertPositiveInteger(reconnectMaxDelayMs, "Redis reconnect max delay");
+		if (!Number.isSafeInteger(maxReconnectAttempts) || maxReconnectAttempts < 0)
+			throw new RedisConfigurationError("Redis reconnect attempts must be non-negative");
+		if (!Number.isSafeInteger(cleanupDelayMs) || cleanupDelayMs < 0)
+			throw new RedisConfigurationError("Redis pool cleanup delay must be non-negative");
 		if (minimum > maximum)
 			throw new RedisConfigurationError("Redis pool minimum cannot exceed maximum");
 		this.pool = createClientPool(
@@ -52,13 +67,10 @@ export class RedisPool implements RedisExecutor {
 				disableOfflineQueue: options.disableOfflineQueue ?? true,
 				socket: {
 					...options.clientOptions?.socket,
-					connectTimeout: options.connectTimeoutMs ?? 3_000,
+					connectTimeout: this.connectTimeoutMs,
 					reconnectStrategy: (attempts) => {
-						if (attempts >= (options.maxReconnectAttempts ?? 3)) return false;
-						return Math.min(
-							(options.reconnectBaseDelayMs ?? 100) * 2 ** attempts,
-							options.reconnectMaxDelayMs ?? 1_000,
-						);
+						if (attempts >= maxReconnectAttempts) return false;
+						return Math.min(reconnectBaseDelayMs * 2 ** attempts, reconnectMaxDelayMs);
 					},
 				},
 			},
@@ -66,47 +78,65 @@ export class RedisPool implements RedisExecutor {
 				minimum,
 				maximum,
 				acquireTimeout: this.acquireTimeoutMs,
-				cleanupDelay: options.cleanupDelayMs ?? 3_000,
+				cleanupDelay: cleanupDelayMs,
 			},
 		);
 		this.pool.on("error", (error) => this.reportError(normalizeNodeRedisError(error)));
 	}
 
 	get isReady(): boolean {
-		return (this.pool as unknown as { isReady?: boolean }).isReady ?? true;
+		return this.connected && this.pool.isOpen && !this.closed;
 	}
 
 	async connect(): Promise<void> {
 		if (this.closed) throw new RedisClientStateError("The Redis pool has been closed");
 		if (this.connected) return;
-		try {
-			this.options.hooks?.onStateChange?.("connecting");
-			await withTimeout(
-				() => this.pool.connect(),
-				this.acquireTimeoutMs,
-				"Redis pool connection timed out",
-			);
-			this.connected = true;
-			this.options.hooks?.onStateChange?.("ready");
-		} catch (error) {
-			const normalized = normalizeNodeRedisError(error);
-			this.reportError(normalized);
-			throw normalized.code === "REDIS_CLIENT_STATE" ||
-				normalized instanceof RedisTimeoutError
-				? normalized
-				: new RedisConnectionError("Redis pool connection failed", normalized);
-		}
+		this.connecting ??= withTimeout(
+			async () => {
+				this.options.hooks?.onStateChange?.("connecting");
+				await this.pool.connect();
+			},
+			this.connectTimeoutMs,
+			"Redis pool connection timed out",
+		)
+			.then(() => {
+				this.connected = true;
+				this.options.hooks?.onStateChange?.("ready");
+			})
+			.catch((error: unknown) => {
+				const normalized = normalizeNodeRedisError(error);
+				this.reportError(normalized);
+				if (
+					normalized.code === "REDIS_CLIENT_STATE" ||
+					normalized instanceof RedisTimeoutError
+				)
+					throw normalized;
+				throw new RedisConnectionError("Redis pool connection failed", normalized);
+			})
+			.finally(() => {
+				this.connecting = null;
+			});
+		await this.connecting;
+		if (this.closed) throw new RedisClientStateError("The Redis pool has been closed");
 	}
 
-	async execute<T = unknown>(command: RedisCommand): Promise<T> {
+	async execute<T = unknown>(
+		command: RedisCommand,
+		request: { signal?: AbortSignal } = {},
+	): Promise<T> {
 		if (this.closed) throw new RedisClientStateError("The Redis pool has been closed");
+		if (request.signal?.aborted)
+			throw new RedisRequestAbortedError(request.signal.reason);
 		await this.connect();
 		const started = Date.now();
 		this.options.hooks?.onCommandStart?.(command);
 		try {
 			return await withTimeout(
-				() => this.pool.sendCommand([...command]) as Promise<T>,
+				(signal) =>
+					this.pool.withAbortSignal(signal).sendCommand([...command]) as Promise<T>,
 				this.commandTimeoutMs,
+				"Redis command timed out",
+				request.signal,
 			);
 		} catch (error) {
 			const normalized = normalizeNodeRedisError(error);
@@ -117,14 +147,21 @@ export class RedisPool implements RedisExecutor {
 		}
 	}
 
-	async eval<T = unknown>(script: string, options: RedisScriptOptions): Promise<T> {
-		return this.execute<T>([
-			"EVAL",
-			script,
-			String(options.keys?.length ?? 0),
-			...(options.keys ?? []),
-			...(options.arguments ?? []),
-		]);
+	async eval<T = unknown>(
+		script: string,
+		options: RedisScriptOptions,
+		request: { signal?: AbortSignal } = {},
+	): Promise<T> {
+		return this.execute<T>(
+			[
+				"EVAL",
+				script,
+				String(options.keys?.length ?? 0),
+				...(options.keys ?? []),
+				...(options.arguments ?? []),
+			],
+			request,
+		);
 	}
 
 	async ping(): Promise<void> {
@@ -140,6 +177,7 @@ export class RedisPool implements RedisExecutor {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		await this.connecting?.catch(() => undefined);
 		await this.pool.close();
 		this.options.hooks?.onStateChange?.("closed");
 	}

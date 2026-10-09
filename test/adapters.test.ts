@@ -4,7 +4,10 @@ import { describe, expect, it } from "vitest";
 import { createBullMqQueueAdapter } from "../src/bullmq/index.js";
 import { jsonCodec } from "../src/core/codec.js";
 import { RedisProtocolError, RedisRequestAbortedError } from "../src/core/errors.js";
-import { createIoredisExecutor } from "../src/ioredis/index.js";
+import {
+	createIoredisExecutor,
+	createIoredisPubSubTransport,
+} from "../src/ioredis/index.js";
 import { normalizeNodeRedisError } from "../src/node/errors.js";
 
 describe("adapter boundaries", () => {
@@ -48,6 +51,22 @@ describe("adapter boundaries", () => {
 		await expect(executor.execute(["GET", "key"])).rejects.toBe(protocolError);
 	});
 
+	it("honors abort signals for in-flight ioredis commands", async () => {
+		const executor = createIoredisExecutor({
+			status: "ready",
+			call: () => new Promise(() => undefined),
+			eval: async () => 1,
+			ping: async () => "PONG",
+		});
+		const controller = new AbortController();
+		const operation = executor.execute(["BLPOP", "queue", "0"], {
+			signal: controller.signal,
+		});
+		controller.abort();
+
+		await expect(operation).rejects.toBeInstanceOf(RedisRequestAbortedError);
+	});
+
 	it("adapts BullMQ queue operations to the common typed queue shape", async () => {
 		let added: unknown;
 		let processed = false;
@@ -80,5 +99,40 @@ describe("adapter boundaries", () => {
 		await runProcessor?.();
 		await worker.close();
 		expect(processed).toBe(true);
+	});
+
+	it("closes only the ioredis subscriber it creates", async () => {
+		let publisherClosed = false;
+		let subscriberClosed = false;
+		const publisher = {
+			publish: async () => 1,
+			subscribe: async () => undefined,
+			unsubscribe: async () => undefined,
+			on() {
+				return this;
+			},
+			duplicate: () => ({
+				publish: async () => 1,
+				subscribe: async () => undefined,
+				unsubscribe: async () => undefined,
+				on() {
+					return this;
+				},
+				off() {
+					return this;
+				},
+				quit: async () => {
+					subscriberClosed = true;
+				},
+			}),
+			quit: async () => {
+				publisherClosed = true;
+			},
+		};
+		const transport = createIoredisPubSubTransport({ publisher });
+
+		await transport.close();
+		expect(subscriberClosed).toBe(true);
+		expect(publisherClosed).toBe(false);
 	});
 });

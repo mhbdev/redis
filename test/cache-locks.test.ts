@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { createCache } from "../src/cache/index.js";
 import { jsonCodec } from "../src/core/codec.js";
+import { RedisConfigurationError, RedisSerializationError } from "../src/core/errors.js";
 import type { RedisCommand, RedisExecutor } from "../src/index.js";
 import { createLockManager } from "../src/locks/index.js";
 
@@ -36,6 +37,19 @@ describe("cache and locks", () => {
 		expect(await cache.get("default")).toEqual({ answer: 42 });
 	});
 
+	it("rejects values that JSON cannot represent", () => {
+		expect(() => jsonCodec<undefined>().encode(undefined)).toThrow(
+			RedisSerializationError,
+		);
+	});
+
+	it("rejects conflicting conditional cache writes", async () => {
+		const cache = createCache({ redis: new MemoryRedis() });
+		await expect(
+			cache.set("key", "value", { onlyIfAbsent: true, onlyIfPresent: true }),
+		).rejects.toBeInstanceOf(RedisConfigurationError);
+	});
+
 	it("serializes typed cache values and coalesces cache misses", async () => {
 		const redis = new MemoryRedis();
 		const cache = createCache({ redis, codec: jsonCodec<{ answer: number }>() });
@@ -61,5 +75,15 @@ describe("cache and locks", () => {
 		const lease = await manager.acquire("resource");
 		expect(lease).not.toBeNull();
 		expect(await lease?.release()).toBe(true);
+	});
+
+	it("updates lease expiry after a successful extension", async () => {
+		const manager = createLockManager({ redis: new MemoryRedis() });
+		const lease = await manager.acquire("resource", 1_000);
+		if (!lease) throw new Error("Expected lock acquisition to succeed");
+		const originalExpiry = lease.expiresAt;
+
+		expect(await lease.extend(60_000)).toBe(true);
+		expect(lease.expiresAt).toBeGreaterThan(originalExpiry);
 	});
 });

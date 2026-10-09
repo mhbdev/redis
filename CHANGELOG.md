@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+### Patch Changes
+
+- Harden Redis queue processing, rate-limit behavior, request cancellation, and client adapter lifecycle handling.
+
 ## 0.2.1
 
 ### Patch Changes

@@ -6,7 +6,11 @@ import {
 	RedisTimeoutError,
 	RedisUnavailableError,
 } from "../core/errors.js";
-import { type RedisExecutor, withTimeout } from "../core/executor.js";
+import {
+	assertPositiveInteger,
+	type RedisExecutor,
+	withTimeout,
+} from "../core/executor.js";
 import { assertKeyPart, hashIdentifier } from "../core/keys.js";
 
 export type RateLimitFailureMode = "open" | "closed";
@@ -140,8 +144,20 @@ export class RedisRateLimiter implements RateLimiter {
 					? options.ephemeralCache
 					: new Map();
 		this.now = options.now ?? Date.now;
-		if (!this.prefix.trim())
-			throw new RedisConfigurationError("Rate-limit prefix is required");
+		assertKeyPart(this.prefix, "Rate-limit prefix");
+		assertPositiveInteger(this.timeoutMs, "Rate-limit timeout");
+		if (this.failureMode !== "open" && this.failureMode !== "closed")
+			throw new RedisConfigurationError("Rate-limit failure mode is invalid");
+		if (algorithm.kind === "fixed-window" || algorithm.kind === "sliding-window") {
+			assertAlgorithmValues(algorithm.limit, algorithm.windowMs);
+		} else if (algorithm.kind === "token-bucket") {
+			assertAlgorithmValues(algorithm.maxTokens ?? algorithm.limit, algorithm.windowMs);
+			assertPositiveInteger(algorithm.refillRate ?? 0, "Token bucket refill rate");
+			if (algorithm.maxTokens !== undefined && algorithm.maxTokens !== algorithm.limit)
+				throw new RedisConfigurationError("Token bucket limit must match its maximum");
+		} else {
+			throw new RedisConfigurationError("Rate-limit algorithm is invalid");
+		}
 	}
 
 	async limit(
@@ -152,29 +168,37 @@ export class RedisRateLimiter implements RateLimiter {
 		const weight = request.rate ?? 1;
 		if (!Number.isSafeInteger(weight) || weight <= 0)
 			throw new RedisConfigurationError("Rate-limit request rate must be positive");
-		const cachedUntil = this.cache?.get(identifier);
+		if (
+			this.algorithm.kind === "token-bucket" &&
+			weight > (this.algorithm.maxTokens ?? this.algorithm.limit)
+		)
+			throw new RedisConfigurationError("Request rate exceeds the token-bucket maximum");
+		const cacheKey = `${identifier}\0${weight}`;
+		const cacheEnabled =
+			this.algorithm.kind !== "sliding-window" && !this.options.dynamicLimits;
+		const cachedUntil = cacheEnabled ? this.cache?.get(cacheKey) : undefined;
 		if (cachedUntil !== undefined) {
 			if (cachedUntil > this.now())
 				return this.response(false, this.algorithm.limit, 0, cachedUntil, "cache");
-			this.cache?.delete(identifier);
+			this.cache?.delete(cacheKey);
 		}
 
 		const started = this.now();
 		try {
-			const dynamicLimit = this.options.dynamicLimits
-				? await this.getDynamicLimit()
-				: null;
-			const result = await withTimeout(
-				() =>
-					this.runAlgorithm(
-						identifier,
-						dynamicLimit ?? this.algorithm.limit,
-						weight,
-						started,
-					),
-				this.timeoutMs,
-			);
-			if (!result.allowed && this.cache) this.cache.set(identifier, result.reset);
+			const result = await withTimeout(async (signal) => {
+				const dynamicLimit = this.options.dynamicLimits
+					? await this.readDynamicLimit(signal)
+					: null;
+				return this.runAlgorithm(
+					identifier,
+					dynamicLimit ?? this.algorithm.limit,
+					weight,
+					started,
+					signal,
+				);
+			}, this.timeoutMs);
+			if (!result.allowed && cacheEnabled && this.cache)
+				this.cache.set(cacheKey, result.reset);
 			const response = this.response(
 				result.allowed,
 				result.limit,
@@ -293,7 +317,9 @@ export class RedisRateLimiter implements RateLimiter {
 		assertIdentifier(identifier);
 		const keys = await this.keysFor(identifier, this.now());
 		if (keys.length) await this.options.redis.execute(["DEL", ...keys]);
-		this.cache?.delete(identifier);
+		for (const key of this.cache?.keys() ?? []) {
+			if (key.slice(0, key.lastIndexOf("\0")) === identifier) this.cache?.delete(key);
+		}
 	}
 
 	async blockUntilReady(
@@ -301,21 +327,21 @@ export class RedisRateLimiter implements RateLimiter {
 		timeoutMs: number,
 		request: RateLimitRequest = {},
 	): Promise<RateLimitResponse> {
-		const deadline = this.now() + timeoutMs;
-		while (this.now() <= deadline) {
-			const result = await this.limit(identifier, request);
-			if (result.success) return result;
+		assertPositiveInteger(timeoutMs, "Rate-limit wait timeout");
+		const deadline = Date.now() + timeoutMs;
+		let result = await this.limit(identifier, request);
+		if (result.success) return result;
+		while (Date.now() < deadline) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
 			await new Promise((resolve) =>
-				setTimeout(
-					resolve,
-					Math.min(
-						Math.max(result.retryAfterMs, 10),
-						Math.max(10, deadline - this.now()),
-					),
-				),
+				setTimeout(resolve, Math.min(Math.max(result.retryAfterMs, 10), remaining)),
 			);
+			if (Date.now() >= deadline) break;
+			result = await this.limit(identifier, request);
+			if (result.success) return result;
 		}
-		return this.limit(identifier, request);
+		return result;
 	}
 
 	async setDynamicLimit(limit: number | false): Promise<void> {
@@ -332,10 +358,14 @@ export class RedisRateLimiter implements RateLimiter {
 
 	async getDynamicLimit(): Promise<number | null> {
 		if (!this.options.dynamicLimits) return null;
-		const value = await this.options.redis.execute<string | null>([
-			"GET",
-			`${this.prefix}:dynamic-limit`,
-		]);
+		return this.readDynamicLimit();
+	}
+
+	private async readDynamicLimit(signal?: AbortSignal): Promise<number | null> {
+		const value = await this.options.redis.execute<string | null>(
+			["GET", `${this.prefix}:dynamic-limit`],
+			signal ? { signal } : undefined,
+		);
 		if (value === null) return null;
 		const limit = Number(value);
 		if (!Number.isSafeInteger(limit) || limit <= 0)
@@ -348,15 +378,20 @@ export class RedisRateLimiter implements RateLimiter {
 		limit: number,
 		weight: number,
 		now: number,
+		signal: AbortSignal,
 	): Promise<{ allowed: boolean; limit: number; remaining: number; reset: number }> {
 		const digest = await hashIdentifier(identifier);
 		if (this.algorithm.kind === "fixed-window") {
 			const start = Math.floor(now / this.algorithm.windowMs) * this.algorithm.windowMs;
 			const reset = start + this.algorithm.windowMs;
-			const value = await this.options.redis.eval<unknown>(FIXED_WINDOW_SCRIPT, {
-				keys: [`${this.prefix}:${digest}:${start}`],
-				arguments: [String(weight), String(reset - now)],
-			});
+			const value = await this.options.redis.eval<unknown>(
+				FIXED_WINDOW_SCRIPT,
+				{
+					keys: [`${this.prefix}:${digest}:${start}`],
+					arguments: [String(weight), String(reset - now)],
+				},
+				{ signal },
+			);
 			const count = parseInteger(value, "fixed-window");
 			return {
 				allowed: count <= limit,
@@ -367,18 +402,22 @@ export class RedisRateLimiter implements RateLimiter {
 		}
 		if (this.algorithm.kind === "sliding-window") {
 			const start = Math.floor(now / this.algorithm.windowMs) * this.algorithm.windowMs;
-			const value = await this.options.redis.eval<unknown>(SLIDING_WINDOW_SCRIPT, {
-				keys: [
-					`${this.prefix}:${digest}:${start}`,
-					`${this.prefix}:${digest}:${start - this.algorithm.windowMs}`,
-				],
-				arguments: [
-					String(weight),
-					String(this.algorithm.windowMs),
-					String(now - start),
-					String(start + this.algorithm.windowMs - now),
-				],
-			});
+			const value = await this.options.redis.eval<unknown>(
+				SLIDING_WINDOW_SCRIPT,
+				{
+					keys: [
+						`${this.prefix}:${digest}:${start}`,
+						`${this.prefix}:${digest}:${start - this.algorithm.windowMs}`,
+					],
+					arguments: [
+						String(weight),
+						String(this.algorithm.windowMs),
+						String(now - start),
+						String(start + this.algorithm.windowMs - now),
+					],
+				},
+				{ signal },
+			);
 			if (!Array.isArray(value) || value.length < 2)
 				throw new RedisProtocolError("Invalid sliding-window response");
 			const weighted = Number(value[1]);
@@ -389,16 +428,20 @@ export class RedisRateLimiter implements RateLimiter {
 				reset: start + this.algorithm.windowMs,
 			};
 		}
-		const value = await this.options.redis.eval<unknown>(TOKEN_BUCKET_SCRIPT, {
-			keys: [`${this.prefix}:bucket:${digest}`],
-			arguments: [
-				String(limit),
-				String(this.algorithm.refillRate),
-				String(this.algorithm.windowMs),
-				String(weight),
-				String(now),
-			],
-		});
+		const value = await this.options.redis.eval<unknown>(
+			TOKEN_BUCKET_SCRIPT,
+			{
+				keys: [`${this.prefix}:bucket:${digest}`],
+				arguments: [
+					String(limit),
+					String(this.algorithm.refillRate),
+					String(this.algorithm.windowMs),
+					String(weight),
+					String(now),
+				],
+			},
+			{ signal },
+		);
 		if (!Array.isArray(value) || value.length < 3)
 			throw new RedisProtocolError("Invalid token-bucket response");
 		const allowed = Number(value[0]) === 1;
@@ -446,7 +489,7 @@ export class RedisRateLimiter implements RateLimiter {
 
 const FIXED_WINDOW_SCRIPT = `local current = redis.call("INCRBY", KEYS[1], ARGV[1]) if current == tonumber(ARGV[1]) then redis.call("PEXPIRE", KEYS[1], ARGV[2]) end return current`;
 const SLIDING_WINDOW_SCRIPT = `local current = redis.call("INCRBY", KEYS[1], ARGV[1]) if current == tonumber(ARGV[1]) then redis.call("PEXPIRE", KEYS[1], ARGV[2]) redis.call("PEXPIRE", KEYS[2], ARGV[2]) end local previous = tonumber(redis.call("GET", KEYS[2]) or "0") local weighted = previous * ((tonumber(ARGV[2]) - tonumber(ARGV[3])) / tonumber(ARGV[2])) + current return {current, weighted}`;
-const TOKEN_BUCKET_SCRIPT = `local state = redis.call("HMGET", KEYS[1], "tokens", "updated") local tokens = tonumber(state[1]) or tonumber(ARGV[1]) local updated = tonumber(state[2]) or tonumber(ARGV[5]) local elapsed = math.max(0, tonumber(ARGV[5]) - updated) local refill = elapsed * tonumber(ARGV[2]) / tonumber(ARGV[3]) tokens = math.min(tonumber(ARGV[1]), tokens + refill) local requested = tonumber(ARGV[4]) local allowed = 0 if tokens >= requested then tokens = tokens - requested allowed = 1 end local reset = tonumber(ARGV[5]) + math.ceil((requested - tokens) * tonumber(ARGV[3]) / tonumber(ARGV[2])) redis.call("HSET", KEYS[1], "tokens", tokens, "updated", ARGV[5]) redis.call("PEXPIRE", KEYS[1], ARGV[3]) return {allowed, tokens, reset}`;
+const TOKEN_BUCKET_SCRIPT = `local state = redis.call("HMGET", KEYS[1], "tokens", "updated") local tokens = tonumber(state[1]) or tonumber(ARGV[1]) local updated = tonumber(state[2]) or tonumber(ARGV[5]) local elapsed = math.max(0, tonumber(ARGV[5]) - updated) local refill = elapsed * tonumber(ARGV[2]) / tonumber(ARGV[3]) tokens = math.min(tonumber(ARGV[1]), tokens + refill) local requested = tonumber(ARGV[4]) local allowed = 0 local needed = requested - tokens if tokens >= requested then tokens = tokens - requested allowed = 1 needed = math.max(0, 1 - tokens) end local reset = tonumber(ARGV[5]) + math.ceil(needed * tonumber(ARGV[3]) / tonumber(ARGV[2])) redis.call("HSET", KEYS[1], "tokens", tokens, "updated", ARGV[5]) redis.call("PEXPIRE", KEYS[1], ARGV[3]) return {allowed, tokens, reset}`;
 
 function assertIdentifier(identifier: string): void {
 	if (!identifier.trim() || identifier.length > 512)

@@ -28,12 +28,18 @@ export class RedisPubSub<T> {
 		const waiters: Array<(result: IteratorResult<T>) => void> = [];
 		let closed = false;
 		let unsubscribe: (() => Promise<void>) | undefined;
+		const stopSubscription = async () => {
+			const stop = unsubscribe;
+			unsubscribe = undefined;
+			await stop?.();
+		};
 		const ready = this.subscribe(channel, (value) => {
 			const waiter = waiters.shift();
 			if (waiter) waiter({ done: false, value });
 			else queue.push(value);
 		}).then((stop) => {
 			unsubscribe = stop;
+			if (closed) return stopSubscription();
 		});
 
 		const iterator: AsyncIterator<T> = {
@@ -45,7 +51,8 @@ export class RedisPubSub<T> {
 			},
 			return: async (): Promise<IteratorResult<T>> => {
 				closed = true;
-				await unsubscribe?.();
+				await ready;
+				await stopSubscription();
 				for (const waiter of waiters.splice(0)) waiter({ done: true, value: undefined });
 				return { done: true, value: undefined };
 			},

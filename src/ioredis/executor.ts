@@ -48,17 +48,18 @@ export class IoredisExecutor implements RedisConnection {
 
 	async execute<T = unknown>(
 		command: RedisCommand,
-		_options?: RedisCommandOptions,
+		options?: RedisCommandOptions,
 	): Promise<T> {
 		return this.run(
 			() => this.client.call(command[0] ?? "", ...command.slice(1)) as Promise<T>,
+			options?.signal,
 		);
 	}
 
 	async eval<T = unknown>(
 		script: string,
 		options: RedisScriptOptions,
-		_options?: RedisCommandOptions,
+		request?: RedisCommandOptions,
 	): Promise<T> {
 		return this.run(
 			() =>
@@ -68,6 +69,7 @@ export class IoredisExecutor implements RedisConnection {
 					...(options.keys ?? []),
 					...(options.arguments ?? []),
 				) as Promise<T>,
+			request?.signal,
 		);
 	}
 
@@ -80,9 +82,14 @@ export class IoredisExecutor implements RedisConnection {
 		else this.client.disconnect?.();
 	}
 
-	private async run<T>(operation: () => Promise<T>): Promise<T> {
+	private async run<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
 		try {
-			return await withTimeout(operation, this.commandTimeoutMs);
+			return await withTimeout(
+				() => operation(),
+				this.commandTimeoutMs,
+				"Redis command timed out",
+				signal,
+			);
 		} catch (error) {
 			const normalized = this.options.normalizeError?.(error);
 			if (normalized) throw normalized;

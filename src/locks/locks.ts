@@ -24,10 +24,15 @@ export class RedisLockManager {
 	constructor(private readonly options: RedisLockOptions) {
 		this.prefix = options.prefix ?? "mhbdev:lock";
 		this.defaultTtlMs = options.defaultTtlMs ?? 30_000;
+		if (!this.prefix.trim() || this.prefix.includes("\n"))
+			throw new RedisLockError("Lock prefix is invalid");
+		if (!Number.isSafeInteger(this.defaultTtlMs) || this.defaultTtlMs <= 0)
+			throw new RedisLockError("Lock TTL must be positive");
 	}
 
 	async acquire(name: string, ttlMs = this.defaultTtlMs): Promise<RedisLockLease | null> {
-		if (!name.trim()) throw new RedisLockError("Lock name is required");
+		if (!name.trim() || name.includes("\n") || name.length > 512)
+			throw new RedisLockError("Lock name is invalid");
 		if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0)
 			throw new RedisLockError("Lock TTL must be positive");
 		const key = `${this.prefix}:${name}`;
@@ -42,11 +47,14 @@ export class RedisLockManager {
 		]);
 		if (result !== "OK") return null;
 		const createdAt = Date.now();
+		let expiresAt = createdAt + ttlMs;
 		let released = false;
 		return {
 			key,
 			token,
-			expiresAt: createdAt + ttlMs,
+			get expiresAt() {
+				return expiresAt;
+			},
 			release: async () => {
 				if (released) return false;
 				const result = await this.options.redis.eval<number>(RELEASE_SCRIPT, {
@@ -64,7 +72,9 @@ export class RedisLockManager {
 					keys: [key],
 					arguments: [token, String(nextTtlMs)],
 				});
-				return result === 1;
+				if (result !== 1) return false;
+				expiresAt = Date.now() + nextTtlMs;
+				return true;
 			},
 		};
 	}

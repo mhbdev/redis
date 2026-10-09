@@ -24,8 +24,13 @@ export class RedisCache<T> {
 	constructor(private readonly options: RedisCacheOptions<T>) {
 		this.prefix = options.prefix ?? "mhbdev:cache";
 		this.codec = options.codec ?? jsonCodec<T>();
-		if (!this.prefix.trim())
+		if (!this.prefix.trim() || this.prefix.includes("\n"))
 			throw new RedisConfigurationError("Cache prefix is required");
+		if (
+			options.maxKeyLength !== undefined &&
+			(!Number.isSafeInteger(options.maxKeyLength) || options.maxKeyLength <= 0)
+		)
+			throw new RedisConfigurationError("Cache max key length must be positive");
 	}
 
 	async get(key: string): Promise<T | undefined> {
@@ -40,6 +45,10 @@ export class RedisCache<T> {
 	}
 
 	async set(key: string, value: T, options: CacheSetOptions = {}): Promise<boolean> {
+		if (options.onlyIfAbsent && options.onlyIfPresent)
+			throw new RedisConfigurationError(
+				"Cache set cannot require both onlyIfAbsent and onlyIfPresent",
+			);
 		const encoded = this.codec.encode(value);
 		const command = ["SET", this.key(key), encoded] as string[];
 		if (options.ttlMs !== undefined) {
@@ -72,7 +81,11 @@ export class RedisCache<T> {
 		if (pending) return (await pending) as T;
 		const operation = factory()
 			.then(async (value) => {
-				await this.set(key, value, options);
+				const stored = await this.set(key, value, options);
+				if (!stored && options.onlyIfAbsent) {
+					const winner = await this.get(key);
+					if (winner !== undefined) return winner;
+				}
 				return value;
 			})
 			.finally(() => this.pending.delete(key));

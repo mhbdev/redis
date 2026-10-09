@@ -88,6 +88,59 @@ describe("RedisRateLimiter", () => {
 		expect((await limiter.limit("id")).reason).toBe("redis");
 	});
 
+	it("does not reuse a denial for a different request weight", async () => {
+		const redis = new ScriptExecutor(6);
+		const limiter = new RedisRateLimiter(fixedWindow(5, 10_000), {
+			redis,
+			ephemeralCache: true,
+			now: () => 1_000,
+		});
+
+		await limiter.limit("id", { rate: 5 });
+		const smallerRequest = await limiter.limit("id", { rate: 1 });
+
+		expect(smallerRequest.reason).toBe("limit");
+		expect(redis.calls).toHaveLength(2);
+	});
+
+	it("does not cache sliding-window denials across changing windows", async () => {
+		const redis = new ScriptExecutor([2, 3]);
+		const limiter = new RedisRateLimiter(slidingWindow(2, 10_000), {
+			redis,
+			ephemeralCache: true,
+			now: () => 1_000,
+		});
+
+		await limiter.limit("id");
+		const repeated = await limiter.limit("id");
+
+		expect(repeated.reason).toBe("limit");
+		expect(redis.calls).toHaveLength(2);
+	});
+
+	it("rejects token-bucket requests larger than capacity", async () => {
+		const limiter = new RedisRateLimiter(tokenBucket(1, 1_000, 2), {
+			redis: new ScriptExecutor([1, 0, 2_000]),
+		});
+
+		await expect(limiter.limit("id", { rate: 3 })).rejects.toThrow(
+			"Request rate exceeds the token-bucket maximum",
+		);
+	});
+
+	it("does not issue another request after blockUntilReady times out", async () => {
+		const redis = new ScriptExecutor(2);
+		const limiter = new RedisRateLimiter(fixedWindow(1, 60_000), {
+			redis,
+			now: () => 1_000,
+		});
+
+		const result = await limiter.blockUntilReady("id", 10);
+
+		expect(result.allowed).toBe(false);
+		expect(redis.calls).toHaveLength(1);
+	});
+
 	it("does not hide configuration or protocol failures in fail-open mode", async () => {
 		const redis: RedisExecutor = {
 			execute: async <T>() => null as T,

@@ -4,7 +4,14 @@ import {
 	type RedisClientType,
 } from "redis";
 
-import { asError, RedisClientStateError, RedisConnectionError } from "../core/errors.js";
+import {
+	asError,
+	RedisClientStateError,
+	RedisConfigurationError,
+	RedisConnectionError,
+	RedisRequestAbortedError,
+	RedisTimeoutError,
+} from "../core/errors.js";
 import {
 	assertPositiveInteger,
 	type RedisCommand,
@@ -76,6 +83,16 @@ export class RedisClient implements RedisConnection {
 		};
 		assertPositiveInteger(this.options.connectTimeoutMs, "Redis connect timeout");
 		assertPositiveInteger(this.options.commandTimeoutMs, "Redis command timeout");
+		if (
+			!Number.isSafeInteger(this.options.maxReconnectAttempts) ||
+			this.options.maxReconnectAttempts < 0
+		)
+			throw new RedisConfigurationError("Redis reconnect attempts must be non-negative");
+		assertPositiveInteger(
+			this.options.reconnectBaseDelayMs,
+			"Redis reconnect base delay",
+		);
+		assertPositiveInteger(this.options.reconnectMaxDelayMs, "Redis reconnect max delay");
 		this.client = this.createClient();
 	}
 
@@ -124,22 +141,24 @@ export class RedisClient implements RedisConnection {
 	async connect(): Promise<void> {
 		if (this.closed) throw new RedisClientStateError("The Redis client has been closed");
 		if (this.client.isReady) return;
+		const client = this.client;
 		this.connecting ??= withTimeout(
 			async () => {
 				this.options.hooks?.onStateChange?.("connecting");
-				try {
-					await this.client.connect();
-				} catch (error) {
-					this.replaceClient();
-					throw new RedisConnectionError("Redis connection failed", error);
-				}
+				await client.connect();
 			},
 			this.options.connectTimeoutMs,
 			"Redis connection timed out",
 		)
 			.catch((error: unknown) => {
-				this.replaceClient();
-				throw error;
+				if (this.client === client) this.replaceClient();
+				if (
+					error instanceof RedisConnectionError ||
+					error instanceof RedisTimeoutError ||
+					error instanceof RedisClientStateError
+				)
+					throw error;
+				throw new RedisConnectionError("Redis connection failed", error);
 			})
 			.finally(() => {
 				this.connecting = null;
@@ -153,13 +172,17 @@ export class RedisClient implements RedisConnection {
 		command: RedisCommand,
 		options: { signal?: AbortSignal } = {},
 	): Promise<T> {
+		if (options.signal?.aborted)
+			throw new RedisRequestAbortedError(options.signal.reason);
 		await this.connect();
 		const started = Date.now();
 		this.options.hooks?.onCommandStart?.(command);
 		try {
 			return await withTimeout(
-				(signal) => this.sendCommand<T>(command, options.signal ?? signal),
+				(signal) => this.sendCommand<T>(command, signal),
 				this.options.commandTimeoutMs,
+				"Redis command timed out",
+				options.signal,
 			);
 		} finally {
 			this.options.hooks?.onCommandEnd?.(command, Date.now() - started);

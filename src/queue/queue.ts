@@ -48,24 +48,36 @@ export class RedisQueue<T> implements JobQueue<T> {
 	private readonly visibilityTimeoutMs: number;
 
 	constructor(private readonly options: QueueOptions<T>) {
-		if (!options.name.trim()) throw new RedisQueueError("Queue name is required");
+		if (!options.name.trim() || options.name.includes("\n"))
+			throw new RedisQueueError("Queue name is invalid");
 		this.prefix = options.prefix ?? "mhbdev:queue";
 		this.valueCodec = options.codec ?? jsonCodec<T>();
 		this.maxAttempts = options.maxAttempts ?? 3;
 		this.visibilityTimeoutMs = options.visibilityTimeoutMs ?? 30_000;
+		if (!this.prefix.trim() || this.prefix.includes("\n"))
+			throw new RedisQueueError("Queue prefix is invalid");
 		if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts <= 0)
 			throw new RedisQueueError("Queue max attempts must be positive");
+		if (!Number.isSafeInteger(this.visibilityTimeoutMs) || this.visibilityTimeoutMs <= 0)
+			throw new RedisQueueError("Queue visibility timeout must be positive");
 	}
 
 	async enqueue(data: T, enqueueOptions: EnqueueOptions = {}): Promise<string> {
+		const delayMs = enqueueOptions.delayMs ?? 0;
+		if (!Number.isSafeInteger(delayMs) || delayMs < 0)
+			throw new RedisQueueError("Queue delay must be a non-negative integer");
+		if (!Number.isSafeInteger(Date.now() + delayMs))
+			throw new RedisQueueError("Queue delivery time is outside the supported range");
+		if (enqueueOptions.jobId !== undefined && !enqueueOptions.jobId.trim())
+			throw new RedisQueueError("Queue job ID is required when provided");
 		const id = enqueueOptions.jobId ?? crypto.randomUUID();
 		const job: QueueJob<T> = { id, data, attempts: 0, enqueuedAt: Date.now() };
 		const encoded = this.encode(job);
-		if ((enqueueOptions.delayMs ?? 0) > 0) {
+		if (delayMs > 0) {
 			await this.options.redis.execute([
 				"ZADD",
 				this.delayedKey,
-				String(Date.now() + (enqueueOptions.delayMs ?? 0)),
+				String(Date.now() + delayMs),
 				encoded,
 			]);
 		} else {
@@ -126,6 +138,16 @@ export class RedisQueue<T> implements JobQueue<T> {
 				attempts: number;
 				enqueuedAt: number;
 			};
+			if (
+				typeof parsed.id !== "string" ||
+				!parsed.id.trim() ||
+				typeof parsed.data !== "string" ||
+				!Number.isSafeInteger(parsed.attempts) ||
+				parsed.attempts < 0 ||
+				!Number.isSafeInteger(parsed.enqueuedAt) ||
+				parsed.enqueuedAt < 0
+			)
+				throw new TypeError("Queue job payload has an invalid shape");
 			return {
 				id: parsed.id,
 				data: this.valueCodec.decode(parsed.data),
@@ -155,6 +177,10 @@ export class RedisQueueWorker<T> implements QueueWorker {
 		this.consumer = options.consumer ?? crypto.randomUUID();
 		this.blockMs = options.blockMs ?? 1_000;
 		this.concurrency = options.concurrency ?? 1;
+		if (!this.group.trim() || !this.consumer.trim())
+			throw new RedisQueueError("Queue consumer group and consumer are required");
+		if (!Number.isSafeInteger(this.blockMs) || this.blockMs <= 0)
+			throw new RedisQueueError("Queue block time must be a positive integer");
 		if (!Number.isSafeInteger(this.concurrency) || this.concurrency <= 0)
 			throw new RedisQueueError("Queue concurrency must be positive");
 	}
@@ -208,25 +234,10 @@ export class RedisQueueWorker<T> implements QueueWorker {
 	}
 
 	private async promoteDue(): Promise<void> {
-		const due = await this.queue.redis.execute<string[]>([
-			"ZRANGEBYSCORE",
-			this.queue.delayedKey,
-			"-inf",
-			String(Date.now()),
-			"LIMIT",
-			"0",
-			"100",
-		]);
-		for (const encoded of due ?? []) {
-			await this.queue.redis.execute(["ZREM", this.queue.delayedKey, encoded]);
-			await this.queue.redis.execute([
-				"XADD",
-				this.queue.streamKey,
-				"*",
-				"payload",
-				encoded,
-			]);
-		}
+		await this.queue.redis.eval(PROMOTE_DUE_SCRIPT, {
+			keys: [this.queue.delayedKey, this.queue.streamKey],
+			arguments: [String(Date.now()), "100"],
+		});
 	}
 
 	private async recoverPending(): Promise<ParsedEntry[]> {
@@ -244,41 +255,31 @@ export class RedisQueueWorker<T> implements QueueWorker {
 	}
 
 	private async process(entry: ParsedEntry): Promise<void> {
-		const job = this.queue.decode(entry.payload);
+		let job: QueueJob<T>;
+		try {
+			job = this.queue.decode(entry.payload);
+		} catch {
+			await this.queue.redis.eval(REQUEUE_FAILED_SCRIPT, {
+				keys: [this.queue.streamKey, this.queue.deadLetterKey],
+				arguments: [this.group, entry.id, entry.payload],
+			});
+			return;
+		}
 		try {
 			await this.handler(job);
-			await this.queue.redis.execute([
-				"XACK",
-				this.queue.streamKey,
-				this.group,
-				entry.id,
-			]);
 		} catch (_error) {
-			await this.queue.redis.execute([
-				"XACK",
-				this.queue.streamKey,
-				this.group,
-				entry.id,
-			]);
-			if (job.attempts + 1 >= this.queue.attempts) {
-				await this.queue.redis.execute([
-					"XADD",
-					this.queue.deadLetterKey,
-					"*",
-					"payload",
-					this.encodeRetry(job),
-				]);
-				return;
-			}
 			const retry = { ...job, attempts: job.attempts + 1 };
-			await this.queue.redis.execute([
-				"XADD",
-				this.queue.streamKey,
-				"*",
-				"payload",
-				this.encodeRetry(retry),
-			]);
+			const target =
+				retry.attempts >= this.queue.attempts
+					? this.queue.deadLetterKey
+					: this.queue.streamKey;
+			await this.queue.redis.eval(REQUEUE_FAILED_SCRIPT, {
+				keys: [this.queue.streamKey, target],
+				arguments: [this.group, entry.id, this.encodeRetry(retry)],
+			});
+			return;
 		}
+		await this.queue.redis.execute(["XACK", this.queue.streamKey, this.group, entry.id]);
 	}
 
 	private encodeRetry(job: QueueJob<T>): string {
@@ -294,6 +295,8 @@ export class RedisQueueWorker<T> implements QueueWorker {
 type ParsedEntry = Readonly<{ id: string; payload: string }>;
 
 const ENSURE_GROUP_SCRIPT = `local groups = redis.pcall("XINFO", "GROUPS", KEYS[1]) if type(groups) == "table" then for _, group in ipairs(groups) do if group[2] == ARGV[1] then return 0 end end end local result = redis.pcall("XGROUP", "CREATE", KEYS[1], ARGV[1], "0-0", "MKSTREAM") if type(result) == "table" then return 1 end local groupsAfter = redis.pcall("XINFO", "GROUPS", KEYS[1]) if type(groupsAfter) == "table" then for _, group in ipairs(groupsAfter) do if group[2] == ARGV[1] then return 0 end end end return redis.error_reply("Redis consumer group creation failed")`;
+const PROMOTE_DUE_SCRIPT = `local due = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2]) for _, payload in ipairs(due) do redis.call("XADD", KEYS[2], "*", "payload", payload) redis.call("ZREM", KEYS[1], payload) end return #due`;
+const REQUEUE_FAILED_SCRIPT = `redis.call("XADD", KEYS[2], "*", "payload", ARGV[3]) redis.call("XACK", KEYS[1], ARGV[1], ARGV[2]) return 1`;
 
 function parseStreamResponse(value: unknown): ParsedEntry[] {
 	if (!Array.isArray(value) || value.length === 0) return [];

@@ -19,6 +19,8 @@ export interface BullMqQueueLike {
 export interface BullMqJobLike {
 	id?: string | number;
 	data: unknown;
+	attemptsMade?: number;
+	timestamp?: number;
 }
 
 export interface BullMqWorkerLike {
@@ -45,13 +47,25 @@ export class BullMqQueueAdapter<T> {
 	) {
 		this.jobName = options.jobName ?? "job";
 		this.codec = options.codec ?? jsonCodec<T>();
+		if (!this.jobName.trim())
+			throw new RedisConfigurationError("BullMQ job name is required");
+		if (
+			options.maxAttempts !== undefined &&
+			(!Number.isSafeInteger(options.maxAttempts) || options.maxAttempts <= 0)
+		)
+			throw new RedisConfigurationError("BullMQ max attempts must be positive");
 	}
 
 	private readonly codec: RedisCodec<T>;
 
 	async enqueue(data: T, enqueueOptions: EnqueueOptions = {}): Promise<string> {
+		const delay = enqueueOptions.delayMs ?? 0;
+		if (!Number.isSafeInteger(delay) || delay < 0)
+			throw new RedisConfigurationError("BullMQ delay must be a non-negative integer");
+		if (enqueueOptions.jobId !== undefined && !enqueueOptions.jobId.trim())
+			throw new RedisConfigurationError("BullMQ job ID is required when provided");
 		const job = await this.queue.add(this.jobName, this.codec.encode(data), {
-			delay: enqueueOptions.delayMs,
+			delay,
 			jobId: enqueueOptions.jobId,
 			attempts: this.options.maxAttempts,
 		});
@@ -83,8 +97,8 @@ export class BullMqQueueAdapter<T> {
 		return {
 			id: String(job.id ?? crypto.randomUUID()),
 			data: this.codec.decode(encoded),
-			attempts: 0,
-			enqueuedAt: Date.now(),
+			attempts: job.attemptsMade ?? 0,
+			enqueuedAt: job.timestamp ?? Date.now(),
 		};
 	}
 }

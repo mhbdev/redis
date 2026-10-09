@@ -8,7 +8,11 @@ export interface RedisCodec<T> {
 export const jsonCodec = <T>(): RedisCodec<T> => ({
 	encode(value) {
 		try {
-			return JSON.stringify(value);
+			const encoded = JSON.stringify(value);
+			if (encoded === undefined) {
+				throw new TypeError("Value is not JSON-serializable");
+			}
+			return encoded;
 		} catch (error) {
 			throw new RedisSerializationError("Unable to encode Redis value", error);
 		}

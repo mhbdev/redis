@@ -17,7 +17,9 @@ environment variables, so authentication, TLS, retry, and sentinel/cluster choic
 remain under application control.
 
 `createIoredisPubSubTransport` accepts a publisher plus an explicit subscriber or a
-publisher with `duplicate()`.
+publisher with `duplicate()`. Closing the transport unsubscribes channels it registered
+and closes only a duplicate subscriber it created. The publisher and an explicitly
+provided subscriber remain owned by the application.
 
 The bridge applies a command timeout (3 seconds by default); configure it with
 `commandTimeoutMs`. If an application uses ioredis-specific error classes, pass a
