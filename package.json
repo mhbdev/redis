@@ -131,5 +131,8 @@
 		"publint": "^0.3.25",
 		"typescript": "7.0.2",
 		"vitest": "^5.0.3"
+	},
+	"overrides": {
+		"magic-string": "1.4.4"
 	}
 }
