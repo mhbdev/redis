@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5
+
+### Patch Changes
+
+- [`84362be`](https://github.com/mhbdev/redis/commit/84362bee4d02196c793d188c1612055095316099) Thanks [@mhbdev](https://github.com/mhbdev)! - Release a maintenance patch for dependency signature verification; runtime behavior is unchanged.
+
 ## 0.2.4
 
 ### Patch Changes
