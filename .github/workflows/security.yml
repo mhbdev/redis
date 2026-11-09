@@ -48,5 +48,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Upgrade npm for signature verification
+        run: npm install --global npm@11.7.0
       - run: npm ci
       - run: npm run audit
