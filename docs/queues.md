@@ -16,12 +16,13 @@ Workers accept metadata-only lifecycle hooks through `QueueWorkerOptions.hooks`:
 
 ```ts
 queue.worker(handleJob, {
-  hooks: {
-    onJobStart: ({ id, attempts }) => metrics.increment("queue.started", { id, attempts }),
-    onJobFailure: ({ id }, error) => reportJobFailure(id, error),
-    onDeadLetter: ({ id }) => metrics.increment("queue.dead_letter", { id }),
-    onError: (error) => reportInfrastructureError(error),
-  },
+	hooks: {
+		onJobStart: ({ id, attempts }) =>
+			metrics.increment("queue.started", { id, attempts }),
+		onJobFailure: ({ id }, error) => reportJobFailure(id, error),
+		onDeadLetter: ({ id }) => metrics.increment("queue.dead_letter", { id }),
+		onError: (error) => reportInfrastructureError(error),
+	},
 });
 ```
 

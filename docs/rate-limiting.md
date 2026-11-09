@@ -2,11 +2,11 @@
 
 The package implements three atomic algorithms:
 
-| Algorithm | Storage | Best for |
-| --- | --- | --- |
-| Fixed window | One counter per time boundary | Lowest cost and simple quotas |
-| Sliding window | Current and previous counters | Fewer boundary bursts |
-| Token bucket | Tokens and last-refill timestamp | Controlled bursts and sustained rate |
+| Algorithm      | Storage                          | Best for                             |
+| -------------- | -------------------------------- | ------------------------------------ |
+| Fixed window   | One counter per time boundary    | Lowest cost and simple quotas        |
+| Sliding window | Current and previous counters    | Fewer boundary bursts                |
+| Token bucket   | Tokens and last-refill timestamp | Controlled bursts and sustained rate |
 
 All algorithms execute their state transition in one Redis script. Identifiers are
 SHA-256 hashed and namespaced with the configured prefix. Weighted requests subtract

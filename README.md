@@ -16,11 +16,11 @@ npm install @mhbdev/redis
 import { createRedisClient, createRedisPool, withRedisClient } from "@mhbdev/redis";
 
 await withRedisClient(
-  { url: process.env.REDIS_URL!, commandTimeoutMs: 3_000 },
-  async (redis) => {
-    await redis.execute(["SET", "health", "ok"]);
-    await redis.ping();
-  },
+	{ url: process.env.REDIS_URL!, commandTimeoutMs: 3_000 },
+	async (redis) => {
+		await redis.execute(["SET", "health", "ok"]);
+		await redis.ping();
+	},
 );
 
 // Long-lived services can keep the client and close it during shutdown.
@@ -28,10 +28,10 @@ const redis = createRedisClient({ url: process.env.REDIS_URL! });
 await redis.execute(["SET", "key", "value"]); // connects lazily
 
 const pool = createRedisPool({
-  url: process.env.REDIS_URL!,
-  minimum: 1,
-  maximum: 10,
-  acquireTimeoutMs: 3_000,
+	url: process.env.REDIS_URL!,
+	minimum: 1,
+	maximum: 10,
+	acquireTimeoutMs: 3_000,
 });
 
 await pool.execute(["SET", "key", "value"]);
@@ -79,14 +79,14 @@ import { createRedisClient } from "@mhbdev/redis";
 
 const redis = createRedisClient({ url: process.env.REDIS_URL! });
 const limiter = createRateLimiter(fixedWindow(10, 60_000), {
-  redis,
-  prefix: "api",
-  ephemeralCache: true,
+	redis,
+	prefix: "api",
+	ephemeralCache: true,
 });
 
 const result = await limiter.limit("user-123");
 if (!result.success) {
-  console.log(`Retry in ${result.retryAfterMs}ms`);
+	console.log(`Retry in ${result.retryAfterMs}ms`);
 }
 ```
 
