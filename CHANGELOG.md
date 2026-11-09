@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4
+
+### Patch Changes
+
+- [#9](https://github.com/mhbdev/redis/pull/9) [`1c7e55f`](https://github.com/mhbdev/redis/commit/1c7e55f9cf7d06a3ace1968423ee8c6ea96441f5) Thanks [@dependabot](https://github.com/apps/dependabot)! - Refresh development dependencies and align Markdown formatting with the updated Biome release.
+
 ## 0.2.3
 
 ### Patch Changes
