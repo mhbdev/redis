@@ -3,7 +3,7 @@
 	"formatter": { "enabled": true, "indentStyle": "tab", "lineWidth": 90 },
 	"files": {
 		"ignoreUnknown": false,
-		"includes": ["**", "!dist", "!coverage", "!node_modules"]
+		"includes": ["**", "!dist", "!coverage", "!node_modules", "!**/.changeset/*.md"]
 	},
 	"linter": {
 		"enabled": true,
